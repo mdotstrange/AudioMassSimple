@@ -1123,6 +1123,22 @@
 					},
 
 					{
+						name: 'Trim End &amp; Overwrite File <span class="pk_shrtct">Shft+E</span>',
+						action: function () {
+							app.fireEvent ('RequestActionTrimEndSave');
+						},
+						clss: 'pk_inact',
+						setup: function ( obj ) {
+							app.listenFor ('DidUnloadFile', function () {
+								obj.classList.add ('pk_inact');
+							});
+							app.listenFor ('DidLoadFile', function () {
+								obj.classList.remove ('pk_inact');
+							});
+						}
+					},
+
+					{
 						name   : 'Channel Info/Flip',
 						action : function () {
 							app.fireEvent ('RequestActionFXUI_Flip');
@@ -3032,7 +3048,12 @@
 			main_context.addOption ('Insert Silence', function( e ) {
 				UI.fireEvent ('RequestFXUI_Silence', 0); // #### call effect
 			}, false );
-			// --- 
+			// keep this option last - onOpen below greys entries out
+			// by hard-coded child index
+			main_context.addOption ('Trim End & Save File', function( e ) {
+				UI.fireEvent ('RequestActionTrimEndSave');
+			}, false );
+			// ---
 
 
 			var copable = false;
@@ -3542,6 +3563,32 @@
 			mt.AddFilesAuto ( e.dataTransfer.files );
 		}, true);
 
+		// capture File System Access handles for dropped files, so edits can be
+		// saved back over the original file on disk. Runs in the capture phase,
+		// before drag.js reads e.dataTransfer.files in its bubble handler;
+		// getAsFileSystemHandle must be called synchronously during dispatch.
+		var dropped_handles = {};
+		_appEl.addEventListener('drop', function ( e ) {
+			var mt = PKAudioEditor && PKAudioEditor.multitrack;
+			if (mt && mt.IsOn && mt.IsOn ()) return ;
+			var items = e.dataTransfer && e.dataTransfer.items;
+			if (!items || !items.length) return ;
+			dropped_handles = {};
+			for (var i = 0; i < items.length; ++i) {
+				(function ( item ) {
+					if (item.kind !== 'file' || !item.getAsFileSystemHandle) return ;
+					var p;
+					try { p = item.getAsFileSystemHandle (); } catch ( err ) { return ; }
+					p && p.then (function ( h ) {
+						if (!h || h.kind !== 'file') return ;
+						dropped_handles[ h.name ] = h;
+						var eng = PKAudioEditor.engine;
+						eng && eng.UpdatePendingHandle && eng.UpdatePendingHandle ( h.name, h );
+					}).catch (function () {});
+				})( items[i] );
+			}
+		}, true);
+
 		dragNDrop( _appEl, 'pk_overlay', function ( e, name ) {
 			var mt = PKAudioEditor && PKAudioEditor.multitrack;
 			if (mt && mt.IsOn && mt.IsOn ()) return ;
@@ -3552,6 +3599,7 @@
 					return ;
 				}
 			}
+			PKAudioEditor.engine.SetPendingSourceFile ( dropped_handles[ name ] || null, name );
 			PKAudioEditor.engine.LoadArrayBuffer ( new Blob([e]) );
 		}, 'arrayBuffer' );
 

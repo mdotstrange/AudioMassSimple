@@ -34,6 +34,23 @@
 		var AudioUtils = new app._deps.audioutils ( app, wavesurfer );
 		this.FXPreviewHost = AudioUtils;
 		q.is_ready = false;
+
+		// original source file of the current buffer (File System Access API)
+		// so edits can be saved back over the file on disk
+		var src_file    = { handle: null, name: '' };
+		var pending_src = null;
+
+		this.SetPendingSourceFile = function ( handle, name ) {
+			pending_src = { handle: handle || null, name: name || '' };
+		};
+		this.GetSourceFile = function () { return src_file; };
+		this.UpdatePendingHandle = function ( name, handle ) {
+			if (!name || !handle) return ;
+			if (pending_src && pending_src.name === name && !pending_src.handle)
+				pending_src.handle = handle;
+			if (src_file && src_file.name === name && !src_file.handle)
+				src_file.handle = handle;
+		};
 		var snap_sel = !w.localStorage || w.localStorage.pk_snapzc !== '0';
 		var loadableAudioExtensions = /\.(aac|aif|aiff|flac|m4a|mp3|oga|ogg|opus|wav|wave|webm)$/i;
 		function isLoadableAudioFile ( file ) {
@@ -89,6 +106,7 @@
 		this.LoadArrayBuffer = function ( e ) {
 			var func = function () {
 				app.listenFor ('RequestCancelModal', function() {
+					pending_src = null;
 					wavesurfer.cancelBufferLoad ();
 					if (wavesurfer.arraybuffer) q.is_ready = true;
 
@@ -155,6 +173,7 @@
 		};
 
 		this.LoadDB = function ( e ) {
+			pending_src = null;
 			var new_buffer = wavesurfer.backend.ac.createBuffer (
 					e.data.length,
 					e.data[0].byteLength / 4,
@@ -210,6 +229,7 @@
 
 			var func = function () {
 				app.listenFor ('RequestCancelModal', function() {
+					pending_src = null;
 					wavesurfer.cancelBufferLoad ();
 					AudioUtils.DownloadFileCancel ();
 					if (wavesurfer.arraybuffer) q.is_ready = true;
@@ -339,6 +359,7 @@
 			}
 		}
 		this.LoadSample = function ( file ) {
+			q.SetPendingSourceFile ( null, '' );
 			app.fireEvent ('WillDownloadFile');
 
 			setTimeout(function () {
@@ -362,6 +383,7 @@
 			}, 180);
 		}
 		this.LoadURL = function ( url ) {
+			q.SetPendingSourceFile ( null, '' );
 			app.fireEvent ('WillDownloadFile');
 
 			/*
@@ -479,6 +501,19 @@
 
 		wavesurfer.on ('ready', function () {
 			app.fireEvent ('DidReadyFire');
+
+			// resolve the source-file record before _add is reset:
+			// append -> buffer no longer maps to one disk file, drop everything;
+			// fresh load -> commit the pending record (or clear if none);
+			// internal reload (trim/undo/redo) -> keep the current record
+			if (wavesurfer.backend._add) {
+				src_file    = { handle: null, name: '' };
+				pending_src = null;
+			}
+			else if (!q.is_ready) {
+				src_file    = pending_src || { handle: null, name: '' };
+				pending_src = null;
+			}
 
 			if (wavesurfer.backend._add) {
 				wavesurfer.backend._add = 0;
@@ -847,6 +882,14 @@
 		accelBind ('KeyModSave', 83, function () {
 			document.querySelector('.pk_opt[data-id="dl"]').click();
 		});
+		app.ui.KeyHandler.addCallback ('KeyShiftTrimEnd' + app.id, function ( key, map, e ) {
+			if (app.ui.InteractionHandler.on || accelHeld ( e )) return ;
+
+			app.fireEvent ('RequestActionTrimEndSave');
+		}, [16, 69]);
+		accelBind ('KeyModTrimEnd', 69, function () {
+			app.fireEvent ('RequestActionTrimEndSave');
+		});
 
 		wavesurfer.container.addEventListener('mousedown', function(e) {
 			if (e.which === 3) {
@@ -901,6 +944,38 @@
 			app.listenFor ('RequestLoadLocalFile', function () {
 				wavesurfer.pause();
 
+				// prefer the File System Access picker so we keep a writable
+				// handle and can save edits back over the original file
+				if (w.showOpenFilePicker) {
+					w.showOpenFilePicker ({
+						multiple: false,
+						types: [{
+							description: 'Audio',
+							accept: { 'audio/*': ['.aac','.aif','.aiff','.flac','.m4a','.mp3','.oga','.ogg','.opus','.wav','.wave','.webm'] }
+						}, {
+							description: 'AudioMass Session',
+							accept: { 'application/octet-stream': ['.amss'] }
+						}]
+					}).then (function ( handles ) {
+						var handle = handles && handles[0];
+						if (!handle) return ;
+						return handle.getFile ().then (function ( file ) {
+							var files = [ file ];
+							if (app.multitrack &&
+								app.multitrack.LoadSessionFiles &&
+								app.multitrack.LoadSessionFiles ( files ))
+							{}
+							else if (app.fireEvent ('RequestLoadPickedFiles', files) !== true)
+							{
+								q.SetPendingSourceFile ( handle, file.name );
+								q.LoadFile ({ files: files });
+							}
+						});
+					}).catch (function () { /* user canceled the picker */ });
+
+					return ;
+				}
+
 				if (input)
 				{
 					input.parentNode.removeChild( input );
@@ -917,7 +992,10 @@
 						app.multitrack.LoadSessionFiles ( input.files ))
 					{}
 					else if (app.fireEvent ('RequestLoadPickedFiles', input.files) !== true)
+					{
+						q.SetPendingSourceFile ( null, input.files[0] && input.files[0].name );
 						q.LoadFile ( input );
+					}
 
 					input.parentNode.removeChild( input );
 					input.onchange = null;
@@ -974,6 +1052,7 @@
 		});
 
 		wavesurfer.on('error', function (error_msg) {
+			pending_src = null;
 
 			// if loading - cancel loading
 			setTimeout(function() {
@@ -1219,6 +1298,123 @@
 			eel.appendChild( imm );
 			*/
 		});
+
+		// deletes everything after the playhead, then re-encodes and silently
+		// overwrites the original file on disk (File System Access API)
+		app.listenFor ('RequestActionTrimEndSave', function () {
+			if (!q.is_ready) return ;
+			if (app.multitrack && app.multitrack.IsOn && app.multitrack.IsOn ()) {
+				OneUp ('Trim End &amp; Save is not available in multitrack mode', 1500);
+				return ;
+			}
+
+			var dur    = q.TrimTo (wavesurfer.getDuration (), 3);
+			var cursor = q.TrimTo (app.ui.GetActiveCursor () || 0, 3);
+			if (cursor <= 0) {
+				OneUp ('Place the playhead where the song should end first', 1600);
+				return ;
+			}
+			if (cursor >= dur) {
+				OneUp ('Playhead is at the end - nothing to trim', 1600);
+				return ;
+			}
+
+			app.fireEvent ('RequestPause');
+
+			// request write permission NOW, synchronously inside the user
+			// gesture - encoding takes seconds and the gesture would expire.
+			// resolves silently with no prompt once already granted.
+			var src = q.GetSourceFile ();
+			var perm_promise = null;
+			if (src && src.handle && src.handle.requestPermission) {
+				try { perm_promise = src.handle.requestPermission ({ mode: 'readwrite' }); }
+				catch ( err ) { perm_promise = null; }
+			}
+
+			app.fireEvent ('StateRequestPush', {
+				desc : 'Trim End',
+				meta : [ cursor, q.TrimTo (dur - cursor, 3) ],
+				data : wavesurfer.backend.buffer
+			});
+
+			AudioUtils.Trim ( cursor, dur - cursor, true );
+			wavesurfer.regions.clear();
+
+			var tmp = (cursor - 0.03);
+			if (tmp < 0) tmp = 0;
+			app.fireEvent ('RequestSeekTo', tmp / wavesurfer.getDuration ());
+
+			var ext = ((src && src.name || '').match (/\.([a-z0-9]+)$/i) || [])[1];
+			ext = (ext || '').toLowerCase ();
+			var enc = ext === 'mp3'  ? { format: 'mp3',  kbps: 320 } :
+			          ext === 'wav'  ? { format: 'wav',  kbps: 0   } :
+			          ext === 'wave' ? { format: 'wav',  kbps: 0   } :
+			          ext === 'flac' ? { format: 'flac', kbps: 5   } : null;
+			var base = (src && src.name || 'audiomass-output').replace (/\.[a-z0-9]+$/i, '');
+			var stereo = wavesurfer.backend.buffer.numberOfChannels === 2;
+
+			if (!src || !src.handle || !perm_promise) {
+				OneUp ('No file access - downloading a trimmed copy instead', 1800);
+				q.DownloadFile ( base + '-trimmed.' + (enc ? enc.format : 'wav'),
+					enc ? enc.format : 'wav', enc ? enc.kbps : 0, false, stereo, 16, false );
+				return ;
+			}
+			if (!enc) {
+				OneUp ('Cannot overwrite .' + ext + ' in place - downloading trimmed WAV', 1900);
+				q.DownloadFile ( base + '-trimmed.wav', 'wav', 0, false, stereo, 16, false );
+				return ;
+			}
+
+			perm_promise.then (function ( perm ) {
+				if (perm !== 'granted') {
+					OneUp ('Write permission denied - trimmed audio kept in editor', 1900);
+					return ;
+				}
+				silentSave ( src, enc, stereo );
+			}).catch (function () {
+				OneUp ('Write permission denied - trimmed audio kept in editor', 1900);
+			});
+		});
+
+		function silentSave ( src, enc, stereo ) {
+			app.fireEvent ('WillDownloadFile');
+			app.listenFor ('RequestCancelModal', function () {
+				AudioUtils.DownloadFileCancel ();
+				setTimeout(function() { app.fireEvent ('DidDownloadFile'); }, 12);
+				app.stopListeningForName ('RequestCancelModal');
+			});
+
+			AudioUtils.DownloadFile ( src.name, enc.format, enc.kbps, false, stereo, 16, false,
+				function ( val ) {
+					if (val === 'done')
+					{
+						setTimeout(function() { app.fireEvent ('DidDownloadFile'); }, 12);
+						app.stopListeningForName ('RequestCancelModal');
+					}
+					else
+						app.fireEvent ('DidProgressModal', val);
+				},
+				null,
+				function ( blob ) {
+					src.handle.createWritable ()
+						.then (function ( ws ) {
+							return ws.write ( blob ).then (function () { return ws.close (); });
+						})
+						.then (function () {
+							OneUp ('Saved over ' + src.name, 1800);
+						})
+						.catch (function ( err ) {
+							OneUp ('Could not write file - downloading a copy', 1900);
+							var url = (window.URL || window.webkitURL).createObjectURL ( blob );
+							var a = d.createElement ('a');
+							a.href = url;
+							a.download = src.name;
+							a.style.display = 'none';
+							d.body.appendChild ( a );
+							a.click ();
+						});
+				});
+		}
 
 		app.listenFor ('RequestActionCopy', function () {
 			if (!q.is_ready) return ;

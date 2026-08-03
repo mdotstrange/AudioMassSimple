@@ -915,7 +915,7 @@
 			}
 		}
 
-		function DownloadFile( with_name, format, kbps, selection, stereo, bit_depth, dither, callback, source_buffer ) {
+		function DownloadFile( with_name, format, kbps, selection, stereo, bit_depth, dither, callback, source_buffer, deliver ) {
 			var originalBuffer = source_buffer ||
 				(wavesurfer && wavesurfer.backend && wavesurfer.backend.buffer);
 			if (!originalBuffer) {
@@ -1017,7 +1017,13 @@
 					progress ( encode_base + (ev.data.percentage * (100 - encode_base) / 100) );
 					return ;
 				}
-				forceDownload( ev.data );
+				if (deliver)
+				{
+					deliver ( ev.data );
+					callback && callback ('done');
+				}
+				else
+					forceDownload( ev.data );
 
 				worker.terminate ();
 				worker = null;
